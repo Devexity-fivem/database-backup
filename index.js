@@ -5,7 +5,6 @@ const archiver = require('archiver');
 const { Webhook, MessageBuilder } = require('discord-webhook-node');
 const config = require('./config.json');
 
-
 const root = GetResourcePath(GetCurrentResourceName());
 const backupDir = path.join(root, 'sql');
 
@@ -15,8 +14,9 @@ if (!fs.existsSync(backupDir)) {
 }
 
 let backupCount = 0;
+let isBackupRunning = false; // Prevent overlapping backups
 
-
+// === Helper Functions ===
 function Delay(ms) {
     return new Promise(res => setTimeout(res, ms));
 }
@@ -25,13 +25,24 @@ function timestamp() {
     return new Date().toISOString().replace(/[:.]/g, '-');
 }
 
+// === Optimized ZIP compression ===
 async function zipFile(inputPath, outputPath) {
     return new Promise((resolve, reject) => {
         const output = fs.createWriteStream(outputPath);
-        const archive = archiver('zip', { zlib: { level: 9 } });
+        // Reduced compression level for better performance
+        const archive = archiver('zip', { 
+            zlib: { level: 1 } 
+        });
 
         output.on('close', () => resolve());
         archive.on('error', err => reject(err));
+        archive.on('warning', (err) => {
+            if (err.code === 'ENOENT') {
+                console.warn('[backup] Archive warning:', err);
+            } else {
+                reject(err);
+            }
+        });
 
         archive.pipe(output);
         archive.file(inputPath, { name: path.basename(inputPath) });
@@ -39,8 +50,15 @@ async function zipFile(inputPath, outputPath) {
     });
 }
 
-
+// === Optimized MySQL Dump Settings ===
 async function performBackup() {
+    if (isBackupRunning) {
+        console.log('[backup] Skipping - backup already in progress');
+        return;
+    }
+    
+    isBackupRunning = true;
+    
     try {
         backupCount++;
         const filename = `${config.database_info.database}-${backupCount}-${timestamp()}.sql`;
@@ -49,6 +67,7 @@ async function performBackup() {
 
         console.log(`[backup] Starting MySQL dump -> ${filepath}`);
 
+        // Optimized dump settings for better performance
         await mysqldump({
             connection: {
                 host: config.database_info.host,
@@ -57,10 +76,19 @@ async function performBackup() {
                 database: config.database_info.database,
             },
             dumpToFile: filepath,
+            compress: false,
+            
+            mysqldumpOptions: {
+                '--quick': true, 
+                '--single-transaction': true, 
+                '--skip-lock-tables': true, 
+                '--no-tablespaces': true, 
+            }
         });
 
         console.log(`[backup] Dump finished: ${filepath}`);
 
+        
         await zipFile(filepath, zipPath);
         console.log(`[backup] Compressed -> ${zipPath}`);
 
@@ -78,17 +106,19 @@ async function performBackup() {
                 .setTimestamp();
 
             try {
-                await hook.send(embed);
-                console.log('[backup] Embed sent. Uploading ZIP...');
-
-                await hook.sendFile(zipPath);
-
+             
+                await Promise.all([
+                    hook.send(embed),
+                    hook.sendFile(zipPath)
+                ]);
+                
                 console.log('[backup] Upload complete!');
             } catch (discordErr) {
                 console.error('[backup] Discord upload error:', discordErr);
             }
         }
 
+       
         if (config.delete_after_upload) {
             try {
                 fs.unlinkSync(filepath);
@@ -101,6 +131,8 @@ async function performBackup() {
 
     } catch (err) {
         console.error('[backup] General error:', err);
+    } finally {
+        isBackupRunning = false; 
     }
 }
 
