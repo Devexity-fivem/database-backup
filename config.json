@@ -14,7 +14,7 @@
     },
 
     "interval": {
-        "time": 30
+        "time": 18000
     },
     
     "delete_after_upload": true
