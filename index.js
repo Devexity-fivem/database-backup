@@ -1,21 +1,54 @@
-// vars //
 const mysqldump = require('mysqldump');
-const config = require('./config.json');
-const { Webhook, MessageBuilder } = require('discord-webhook-node');
 const fs = require('fs');
-const archiver = require('archiver');
 const path = require('path');
+const archiver = require('archiver');
+const { Webhook, MessageBuilder } = require('discord-webhook-node');
+const config = require('./config.json');
+
+
 const root = GetResourcePath(GetCurrentResourceName());
-let num = 0;
+const backupDir = path.join(root, 'sql');
 
-// loop //
-setInterval(async () => {
+if (!fs.existsSync(backupDir)) {
+    fs.mkdirSync(backupDir, { recursive: true });
+    console.log(`[backup] Created directory: ${backupDir}`);
+}
+
+let backupCount = 0;
+
+
+function Delay(ms) {
+    return new Promise(res => setTimeout(res, ms));
+}
+
+function timestamp() {
+    return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+async function zipFile(inputPath, outputPath) {
+    return new Promise((resolve, reject) => {
+        const output = fs.createWriteStream(outputPath);
+        const archive = archiver('zip', { zlib: { level: 9 } });
+
+        output.on('close', () => resolve());
+        archive.on('error', err => reject(err));
+
+        archive.pipe(output);
+        archive.file(inputPath, { name: path.basename(inputPath) });
+        archive.finalize();
+    });
+}
+
+
+async function performBackup() {
     try {
-        num++;
-        const sqlFile = path.join(root, `sql/${config.database_info.database}-${num}-${Date.now()}.sql`);
-        const zipFile = sqlFile.replace('.sql', '.zip');
+        backupCount++;
+        const filename = `${config.database_info.database}-${backupCount}-${timestamp()}.sql`;
+        const filepath = path.join(backupDir, filename);
+        const zipPath = filepath.replace('.sql', '.zip');
 
-        // Step 1: Dump database to SQL file
+        console.log(`[backup] Starting MySQL dump -> ${filepath}`);
+
         await mysqldump({
             connection: {
                 host: config.database_info.host,
@@ -23,52 +56,58 @@ setInterval(async () => {
                 password: config.database_info.password,
                 database: config.database_info.database,
             },
-            dumpToFile: sqlFile,
+            dumpToFile: filepath,
         });
 
-        // Step 2: Zip the SQL file
-        await zipFileAsync(sqlFile, zipFile);
+        console.log(`[backup] Dump finished: ${filepath}`);
 
-        // Step 3: Delete original SQL to save space (optional)
-        fs.unlinkSync(sqlFile);
+        await zipFile(filepath, zipPath);
+        console.log(`[backup] Compressed -> ${zipPath}`);
 
-        // Step 4: Upload to Discord
-        if (config.discord.savetodiscord) {
+        if (config.discord && config.discord.savetodiscord && config.discord.webhook) {
+            console.log('[backup] Preparing Discord upload...');
+
             const hook = new Webhook(config.discord.webhook);
             const embed = new MessageBuilder()
-                .setAuthor('Database Backup')
-                .setColor(config.discord.color)
-                .addField('Database', config.database_info.database)
-                .addField('Backup File', path.basename(zipFile))
+                .setAuthor('Database Backup Complete')
+                .setColor(config.discord.color || '#00AAFF')
+                .addField('Database', config.database_info.database, true)
+                .addField('File', path.basename(zipPath), true)
                 .addField('Date', new Date().toLocaleString())
-                .setFooter(config.discord.footer)
+                .setFooter(config.discord.footer || 'Auto SQL Backup')
                 .setTimestamp();
 
-            await hook.send(embed);
-            await hook.sendFile(zipFile);
+            try {
+                await hook.send(embed);
+                console.log('[backup] Embed sent. Uploading ZIP...');
+
+                await hook.sendFile(zipPath);
+
+                console.log('[backup] Upload complete!');
+            } catch (discordErr) {
+                console.error('[backup] Discord upload error:', discordErr);
+            }
         }
 
-        console.log(`[Backup] Database saved & uploaded: ${zipFile}`);
+        if (config.delete_after_upload) {
+            try {
+                fs.unlinkSync(filepath);
+                fs.unlinkSync(zipPath);
+                console.log(`[backup] Deleted local files: ${filename} & ${path.basename(zipPath)}`);
+            } catch (err) {
+                console.warn(`[backup] Cleanup failed: ${err}`);
+            }
+        }
+
     } catch (err) {
-        console.error('Backup failed:', err);
+        console.error('[backup] General error:', err);
     }
-}, config.interval.time * 1000 * 60);
-
-// functions //
-function Delay(ms) {
-    return new Promise((res) => setTimeout(res, ms));
 }
 
-function zipFileAsync(inputFile, outputFile) {
-    return new Promise((resolve, reject) => {
-        const output = fs.createWriteStream(outputFile);
-        const archive = archiver('zip', { zlib: { level: 9 } });
 
-        output.on('close', () => resolve());
-        archive.on('error', (err) => reject(err));
+const intervalMs = (config.interval.time || 180) * 1000 * 60;
+console.log(`[backup] Starting scheduled backups every ${intervalMs / 1000 / 60} minutes.`);
 
-        archive.pipe(output);
-        archive.file(inputFile, { name: path.basename(inputFile) });
-        archive.finalize();
-    });
-}
+
+performBackup();
+setInterval(performBackup, intervalMs);
