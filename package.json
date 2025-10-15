@@ -2,6 +2,6 @@
   "dependencies": {
     "discord-webhook-node": "^1.1.8",
     "mysqldump": "^3.2.0",
-    "archiver": "^5.3.2"
+    "pather": "0.0.12"
   }
 }
